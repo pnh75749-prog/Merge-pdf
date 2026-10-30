@@ -1,20 +1,32 @@
 from __future__ import annotations
 
+import hmac
+import json
+import os
+import tempfile
+import time
+import uuid
 from io import BytesIO
-from pathlib import Path
+from decimal import Decimal
+from functools import lru_cache
+from pathlib import Path, PurePosixPath
 import re
-import shutil
+from typing import TYPE_CHECKING
 
-import fitz
-import numpy as np
 from flask import Flask, jsonify, render_template_string, request
 from pypdf import PdfReader, PdfWriter
-from rapidocr_onnxruntime import RapidOCR
+
+if TYPE_CHECKING:
+  import numpy as np
+  from rapidocr_onnxruntime import RapidOCR
 
 app = Flask(__name__)
-source_directory: Path | None = None
-output_directory: Path | None = None
-ocr_engine: RapidOCR | None = None
+ocr_engine = None
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
+
+MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(500 * 1024 * 1024)))
+MAX_WORKSPACE_BYTES = int(os.getenv("MAX_WORKSPACE_BYTES", str(2 * 1024 * 1024 * 1024)))
+MAX_WORKSPACE_FILES = 100
 
 HTML_PAGE = """
 <!doctype html>
@@ -466,34 +478,7 @@ HTML_PAGE = """
       .muted {
         color: #777e8d;
       }
-      .workflow-card {
-        margin-bottom: 20px;
-      }
-      .workflow-grid {
-        display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 12px;
-      }
-      .workflow-step {
-        min-height: 100px;
-        border: 1px solid #fff;
-        border-radius: 18px;
-        padding: 15px;
-        background: #f7f8fc;
-      }
-      .workflow-step.current {
-        border-color: #171923;
-        background: #171923;
-        color: #fff;
-      }
-      .step-label {
-        color: #858b9a;
-        font-size: 10px;
-      }
-      .workflow-step.current .step-label,
-      .workflow-step.current .step-status {
-        color: rgba(255, 255, 255, 0.65);
-      }
+     
       .step-name {
         margin: 7px 0 10px;
         font-size: 13px;
@@ -626,6 +611,7 @@ HTML_PAGE = """
         grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: 13px;
         margin-top: 18px;
+        margin-bottom: 18px;
       }
       .stat-card {
         min-height: 114px;
@@ -869,8 +855,8 @@ HTML_PAGE = """
           </button>
         </nav>
         <div class="sidebar-note">
-          <strong>Files stay on your device</strong>
-          Choose folders from this computer. PDF operations run locally.
+          <strong>Private cloud workspace</strong>
+          Uploads stay private. Original PDFs are never changed.
         </div>
       </aside>
 
@@ -878,7 +864,7 @@ HTML_PAGE = """
         <header class="topbar">
           <div class="breadcrumbs"><span>PDF Workshop</span><span>/</span><strong id="pageTitle">Dashboard</strong></div>
           <div class="top-actions">
-            <span class="local-badge">Local workspace</span>
+            <span class="local-badge">Cloud workspace</span>
             <button class="button secondary small" id="clearButton" type="button">Clear session</button>
           </div>
         </header>
@@ -909,37 +895,28 @@ HTML_PAGE = """
             <div>
               <p class="eyebrow">PDF Merge Workshop</p>
               <h1>Dashboard</h1>
-              <p class="page-description">A clear view of your PDF workflow. Choose a source folder, then merge subfolders or rename PDFs in the main folder.</p>
+              <p class="page-description">Upload a folder or select PDFs, then create renamed copies or merge each subfolder.</p>
             </div>
           </div>
 
-          <section class="card workflow-card">
-            <div class="card-heading"><h2>Workflow</h2><span class="muted" style="font-size: 11px">Four simple steps</span></div>
-            <div class="workflow-grid">
-              <div class="workflow-step">
-                <div class="step-label">STEP 1</div><div class="step-name">Choose folder</div><div class="step-status">Select a main folder</div>
-              </div>
-              <div class="workflow-step">
-                <div class="step-label">STEP 2</div><div class="step-name">Rename</div><div class="step-status">Optional · main-folder PDFs</div>
-              </div>
-              <div class="workflow-step current">
-                <div class="step-label">STEP 3</div><div class="step-name">Merge</div><div class="step-status">Process PDF subfolders</div>
-              </div>
-              <div class="workflow-step">
-                <div class="step-label">STEP 4</div><div class="step-name">Save</div><div class="step-status">Choose a destination</div>
-              </div>
-            </div>
-          </section>
+            <div class="stat-grid">
+                      <section class="card stat-card"><p>PDFs in main folder</p><strong id="statsPdfCount">0</strong></section>
+                      <section class="card stat-card"><p>Subfolders ready to merge</p><strong id="statsFolderCount">0</strong></section>
+                      <section class="card stat-card"><p>PDFs renamed this run</p><strong id="statsRenamedCount">0</strong></section>
+             </div>
 
           <div class="dashboard-grid">
             <section class="card">
               <div class="card-heading"><h2>Quick actions</h2></div>
               <div class="quick-grid">
                 <button class="action-tile" id="sourceButton" type="button">
-                  <span class="tile-icon" aria-hidden="true">▣</span><span><strong>Choose main folder</strong><small>Load folders and PDFs</small></span>
+                  <span class="tile-icon" aria-hidden="true">▣</span><span><strong>Upload folder</strong><small>Keep subfolder structure</small></span>
+                </button>
+                <button class="action-tile" id="pdfButton" type="button">
+                  <span class="tile-icon" aria-hidden="true">＋</span><span><strong>Upload PDFs</strong><small>Select multiple files</small></span>
                 </button>
                 <button class="action-tile" id="outputButton" type="button">
-                  <span class="tile-icon" aria-hidden="true">⇩</span><span><strong>Choose save destination</strong><small>Select where merged PDFs go</small></span>
+                  <span class="tile-icon" aria-hidden="true">⇩</span><span><strong>Download results</strong><small>Get completed PDF outputs</small></span>
                 </button>
                 <button class="action-tile" type="button" data-nav="merge">
                   <span class="tile-icon" aria-hidden="true">▤</span><span><strong>Merge PDFs</strong><small>Combine files in each subfolder</small></span>
@@ -949,9 +926,11 @@ HTML_PAGE = """
                 </button>
               </div>
               <div class="location-grid">
-                <div class="location-card"><h3>MAIN FOLDER</h3><p id="sourceLocation">Source folder: Not selected.</p></div>
-                <div class="location-card"><h3>SAVE DESTINATION</h3><p id="outputLocation" aria-live="polite">Save location: Not selected. Choose Save Destination to open the Windows folder picker.</p></div>
+                <div class="location-card"><h3>SOURCE</h3><p id="sourceLocation">Source: No PDFs uploaded.</p></div>
+                <div class="location-card"><h3>CLOUD RESULTS</h3><p id="outputLocation" aria-live="polite">Processed PDFs are stored securely for a limited time.</p><div id="downloadList"></div></div>
               </div>
+              <input id="folderInput" class="hidden-input" type="file" webkitdirectory directory multiple accept="application/pdf,.pdf" />
+              <input id="pdfInput" class="hidden-input" type="file" multiple accept="application/pdf,.pdf" />
             </section>
 
             <section class="card">
@@ -964,15 +943,11 @@ HTML_PAGE = """
             </section>
           </div>
 
-          <div class="stat-grid">
-            <section class="card stat-card"><p>PDFs in main folder</p><strong id="statsPdfCount">0</strong></section>
-            <section class="card stat-card"><p>Subfolders ready to merge</p><strong id="statsFolderCount">0</strong></section>
-            <section class="card stat-card"><p>PDFs renamed this run</p><strong id="statsRenamedCount">0</strong></section>
-          </div>
+        
 
           <div class="warning">
             <span aria-hidden="true">⚠</span>
-            <div><strong>Permanent delete notice:</strong> Each source subfolder is permanently deleted after its merged PDF is saved. The save destination must be outside the source subfolder.</div>
+            <div><strong>Original files are preserved.</strong> Merged and renamed files are saved separately in cloud storage and expire after the configured retention period.</div>
           </div>
         </section>
 
@@ -981,7 +956,7 @@ HTML_PAGE = """
             <div>
               <p class="eyebrow">Stage 3 of 4</p>
               <h1>Merge PDFs</h1>
-              <p class="page-description">Combine the PDFs in each subfolder into its own file. Successfully merged source folders are permanently deleted.</p>
+              <p class="page-description">Combine the PDFs in each subfolder into a separate downloadable file. Original uploads remain unchanged.</p>
             </div>
             <button class="button" id="mergeButton" type="button">Start merge</button>
           </div>
@@ -994,8 +969,7 @@ HTML_PAGE = """
             </section>
             <aside class="card">
               <div class="card-heading"><h2>Before you merge</h2></div>
-              <p class="muted" style="margin: 0; font-size: 12px; line-height: 1.7">Choose both a main folder and save destination from the Dashboard. Each eligible subfolder is saved as a separate merged PDF.</p>
-              <div class="warning" style="margin-top: 16px"><span aria-hidden="true">⚠</span><div>Once a merged PDF is safely saved, its source subfolder and contents are permanently removed.</div></div>
+              <p class="muted" style="margin: 0; font-size: 12px; line-height: 1.7">Upload a folder or select PDFs from the Dashboard. Each subfolder with PDFs is saved as its own cloud result.</p>
             </aside>
           </div>
         </section>
@@ -1005,7 +979,7 @@ HTML_PAGE = """
             <div>
               <p class="eyebrow">Stage 2 of 4</p>
               <h1>Rename PDFs</h1>
-              <p class="page-description">Rename PDFs directly in the selected main folder using the letter and 1- to 8-digit number found on the first page. Existing names are checked against PDF content too.</p>
+              <p class="page-description">Create renamed copies using the letter and 1- to 8-digit number detected on each first page.</p>
             </div>
             <div class="job-actions">
               <button class="button secondary" id="renameAgainButton" type="button">Rename again</button>
@@ -1022,7 +996,7 @@ HTML_PAGE = """
             <aside class="card">
               <div class="card-heading"><h2>How renaming works</h2></div>
               <p class="muted" style="margin: 0; font-size: 12px; line-height: 1.7">The first page is checked for an identifier. If it cannot be detected, you can enter the ID manually. Existing files are never overwritten.</p>
-              <div class="location-card" style="margin-top: 16px"><h3>SAFETY</h3><p>Subfolders and the save destination are not included in renaming.</p></div>
+              <div class="location-card" style="margin-top: 16px"><h3>SAFETY</h3><p>Original PDFs are preserved. Files in subfolders are not included in renaming.</p></div>
             </aside>
           </div>
         </section>
@@ -1036,6 +1010,9 @@ HTML_PAGE = """
 
     <script>
       const sourceButton = document.getElementById('sourceButton');
+      const pdfButton = document.getElementById('pdfButton');
+      const folderInput = document.getElementById('folderInput');
+      const pdfInput = document.getElementById('pdfInput');
       const mergeButton = document.getElementById('mergeButton');
       const renameButton = document.getElementById('renameButton');
       const renameAgainButton = document.getElementById('renameAgainButton');
@@ -1048,6 +1025,7 @@ HTML_PAGE = """
       const folderList = document.getElementById('folderList');
       const sourceLocation = document.getElementById('sourceLocation');
       const outputLocation = document.getElementById('outputLocation');
+      const downloadList = document.getElementById('downloadList');
       const renameFileList = document.getElementById('renameFileList');
       const progressPanel = document.getElementById('progressPanel');
       const progressBar = document.getElementById('progressBar');
@@ -1067,13 +1045,36 @@ HTML_PAGE = """
       const mergeFolderCount = document.getElementById('mergeFolderCount');
 
       let sourceDirectory = null;
+      let sourceRootName = '';
       let sourceFolders = [];
       let sourcePdfGroups = [];
-      let outputDirectory = null;
       let activeJob = null;
+      let activeJobId = null;
+      let lastJobId = null;
       let pauseRequested = false;
       let stopRequested = false;
       let resumePausedJob = null;
+      let apiToken = sessionStorage.getItem('pdfWorkshopToken') || '';
+
+      async function apiFetch(url, options = {}) {
+        if (!apiToken) {
+          apiToken = window.prompt('Enter the PDF Workshop access token:') || '';
+          if (apiToken) sessionStorage.setItem('pdfWorkshopToken', apiToken);
+        }
+        if (!apiToken) throw new Error('An access token is required.');
+        const headers = { ...(options.headers || {}), Authorization: `Bearer ${apiToken}` };
+        if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
+        const response = await fetch(url, { ...options, headers });
+        const result = await response.json();
+        if (!response.ok) {
+          if (response.status === 401) {
+            sessionStorage.removeItem('pdfWorkshopToken');
+            apiToken = '';
+          }
+          throw new Error(result.error || `Request failed (${response.status}).`);
+        }
+        return result;
+      }
 
       function showPage(pageName) {
         document.querySelectorAll('[data-page]').forEach(page => {
@@ -1100,6 +1101,7 @@ HTML_PAGE = """
       function updateJobControls() {
         const isActive = activeJob !== null;
         sourceButton.disabled = isActive;
+        pdfButton.disabled = isActive;
         outputButton.disabled = isActive;
         mergeButton.disabled = isActive;
         renameButton.disabled = isActive;
@@ -1125,34 +1127,46 @@ HTML_PAGE = """
         }
       }
 
-      function resumeCurrentJob() {
+      async function resumeCurrentJob() {
         if (!activeJob || !pauseRequested) return;
-        pauseRequested = false;
-        resumePausedJob?.();
-        resumePausedJob = null;
-        updateJobControls();
-        summary.textContent = `${activeJob === 'rename' ? 'Renaming' : 'Merging'} resumed.`;
+        try {
+          await apiFetch(`/jobs/${activeJobId}/control`, { method: 'POST', body: JSON.stringify({ action: 'resume' }) });
+          pauseRequested = false;
+          updateJobControls();
+          summary.textContent = `${activeJob === 'rename' ? 'Renaming' : 'Merging'} resumed.`;
+        } catch (error) {
+          summary.textContent = `Could not resume job: ${error.message}`;
+        }
       }
 
-      function pauseCurrentJob() {
+      async function pauseCurrentJob() {
         if (!activeJob || pauseRequested || stopRequested) return;
-        pauseRequested = true;
-        updateJobControls();
-        summary.textContent = `${activeJob === 'rename' ? 'Renaming' : 'Merging'} paused after the current ${activeJob === 'rename' ? 'PDF' : 'subfolder'} completes.`;
+        try {
+          await apiFetch(`/jobs/${activeJobId}/control`, { method: 'POST', body: JSON.stringify({ action: 'pause' }) });
+          pauseRequested = true;
+          updateJobControls();
+          summary.textContent = `${activeJob === 'rename' ? 'Renaming' : 'Merging'} paused after the current ${activeJob === 'rename' ? 'PDF' : 'subfolder'} completes.`;
+        } catch (error) {
+          summary.textContent = `Could not pause job: ${error.message}`;
+        }
       }
 
-      function stopCurrentJob() {
+      async function stopCurrentJob() {
         if (!activeJob || stopRequested) return;
-        stopRequested = true;
-        pauseRequested = false;
-        resumePausedJob?.();
-        resumePausedJob = null;
-        updateJobControls();
-        summary.textContent = `Stopping after the current ${activeJob === 'rename' ? 'PDF' : 'subfolder'} completes...`;
+        try {
+          await apiFetch(`/jobs/${activeJobId}/control`, { method: 'POST', body: JSON.stringify({ action: 'stop' }) });
+          stopRequested = true;
+          pauseRequested = false;
+          updateJobControls();
+          summary.textContent = `Stopping after the current ${activeJob === 'rename' ? 'PDF' : 'subfolder'} completes...`;
+        } catch (error) {
+          summary.textContent = `Could not stop job: ${error.message}`;
+        }
       }
 
-      function startJob(jobName) {
+      function startJob(jobName, jobId) {
         activeJob = jobName;
+        activeJobId = jobId;
         pauseRequested = false;
         stopRequested = false;
         updateJobControls();
@@ -1160,6 +1174,7 @@ HTML_PAGE = """
 
       function finishJob() {
         activeJob = null;
+        activeJobId = null;
         pauseRequested = false;
         stopRequested = false;
         resumePausedJob = null;
@@ -1266,7 +1281,10 @@ HTML_PAGE = """
         }[result.status] || result.status;
         item.dataset.status = result.status;
         const label = document.createElement('span');
-        label.textContent = `${result.filename} — ${statusText}${result.message ? `: ${result.message}` : ''}`;
+        const displayedName = result.output_filename
+          ? `${result.filename} → ${result.output_filename}`
+          : result.filename;
+        label.textContent = `${displayedName} — ${statusText}${result.message ? `: ${result.message}` : ''}`;
         item.replaceChildren(label);
         item.classList.toggle(
           'is-complete',
@@ -1290,18 +1308,19 @@ HTML_PAGE = """
 
             manualRenameButton.disabled = true;
             try {
-              const response = await fetch('/rename-pdfs', {
+              const queued = await apiFetch('/jobs/manual-rename', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename: result.filename, identifier: identifier.trim() }),
+                body: JSON.stringify({
+                  workspace_id: sourceDirectory,
+                  relative_path: result.relative_path || result.filename,
+                  identifier: identifier.trim(),
+                }),
               });
-              const responseResult = await response.json();
-              if (!response.ok) {
-                throw new Error(responseResult.error || `Could not rename ${result.filename}.`);
-              }
-              const fileResult = responseResult.folders.flatMap(folder => folder.results)[0];
+              const jobResult = await runQueuedJob(queued.job_id, 'rename');
+              const fileResult = jobResult.results?.[0];
               if (!fileResult) throw new Error(`No rename result was returned for ${result.filename}.`);
-              updatePdfFileItem(item, fileResult, onManualResult);
+              lastJobId = queued.job_id;
+              updatePdfFileItem(item, fileResult);
               onManualResult?.(fileResult);
               summary.textContent = fileResult.status === 'renamed'
                 ? `Renamed ${result.filename} to ${fileResult.filename} using the entered ID.`
@@ -1337,11 +1356,15 @@ HTML_PAGE = """
 
       function clearDashboard() {
         sourceDirectory = null;
+        sourceRootName = '';
         sourceFolders = [];
         sourcePdfGroups = [];
-        outputDirectory = null;
-        sourceLocation.textContent = 'Source folder: Not selected.';
-        outputLocation.textContent = 'Save location: Not selected. Choose Save Destination to open the Windows folder picker.';
+        lastJobId = null;
+        sessionStorage.removeItem('pdfWorkshopWorkspace');
+        sessionStorage.removeItem('pdfWorkshopJob');
+        sourceLocation.textContent = 'Source: No PDFs uploaded.';
+        outputLocation.textContent = 'Processed PDFs are stored securely for a limited time.';
+        downloadList.replaceChildren();
         renameFileList.innerHTML = '<p>No main folder selected yet.</p>';
         folderList.innerHTML = '<p>No folder selected yet.</p>';
         summary.textContent = '';
@@ -1357,133 +1380,199 @@ HTML_PAGE = """
         statsFolderCount.textContent = '0';
         statsRenamedCount.textContent = '0';
         mergeFolderCount.textContent = 'Choose a main folder to begin.';
+        folderInput.value = '';
+        pdfInput.value = '';
       }
 
-      sourceButton.addEventListener('click', async () => {
+      async function uploadFiles(selectedFiles, directoryMode) {
+        const pdfFiles = [...selectedFiles].filter(file =>
+          file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
+        );
+        if (!pdfFiles.length) {
+          summary.textContent = 'Select at least one PDF file.';
+          return;
+        }
+        const rootName = directoryMode
+          ? (pdfFiles[0].webkitRelativePath.split('/')[0] || 'Uploaded folder')
+          : 'Selected PDFs';
+        const entries = pdfFiles.map(file => {
+          const parts = directoryMode ? file.webkitRelativePath.split('/') : [file.name];
+          if (directoryMode) parts.shift();
+          return { file, relative_path: parts.join('/'), size: file.size };
+        });
+        if (entries.some(entry => !entry.relative_path || entry.file.size <= 0)) {
+          summary.textContent = 'A selected PDF has an invalid path or is empty.';
+          return;
+        }
+        sourceButton.disabled = true;
+        pdfButton.disabled = true;
+        summary.textContent = `Preparing ${entries.length} PDF uploads...`;
         try {
-          summary.textContent = 'Select the main folder that contains the PDF subfolders.';
-          const response = await fetch('/choose-source', { method: 'POST' });
-          const result = await response.json();
-          if (!response.ok) throw new Error(result.error || 'Could not choose the main folder.');
-          if (result.cancelled) {
-            summary.textContent = 'Main folder selection canceled.';
-            return;
+          const workspace = await apiFetch('/workspaces', {
+            method: 'POST',
+            body: JSON.stringify({
+              root_name: rootName,
+              files: entries.map(({ relative_path, size }) => ({ relative_path, size })),
+            }),
+          });
+          for (let index = 0; index < workspace.uploads.length; index += 1) {
+            const upload = workspace.uploads[index];
+            const entry = entries.find(candidate => candidate.relative_path === upload.relative_path);
+            summary.textContent = `Uploading PDF ${index + 1} of ${entries.length}: ${entry.file.name}`;
+            const formData = new FormData();
+            Object.entries(upload.fields).forEach(([name, value]) => formData.append(name, value));
+            formData.append('file', entry.file);
+            const response = await fetch(upload.url, { method: 'POST', body: formData });
+            if (!response.ok) throw new Error(`Could not upload ${entry.file.name} (${response.status}).`);
           }
-          sourceDirectory = result.path;
-          sourceFolders = result.folders.sort((left, right) => compareFolderNames(left.name, right.name));
-          sourcePdfGroups = result.pdf_groups;
-          sourceLocation.textContent = `Source folder: ${sourceDirectory}`;
+          sourceDirectory = workspace.workspace_id;
+          sourceRootName = workspace.root_name;
+          sourceFolders = workspace.folders.sort((left, right) => compareFolderNames(left.name, right.name));
+          sourcePdfGroups = workspace.root_files.length ? [{
+            name: sourceRootName,
+            is_root: true,
+            pdf_count: workspace.root_files.length,
+            pdf_files: workspace.root_files,
+          }] : [];
+          sessionStorage.setItem('pdfWorkshopWorkspace', JSON.stringify({
+            workspace_id: sourceDirectory,
+            root_name: sourceRootName,
+            folders: sourceFolders,
+            root_files: workspace.root_files,
+            file_count: entries.length,
+          }));
+          sourceLocation.textContent = `Source: ${sourceRootName} (${entries.length} PDFs)`;
           renderFolders(sourceFolders);
           renderPdfFiles(sourcePdfGroups);
-          const pdfCount = sourcePdfGroups.reduce((count, group) => count + group.pdf_count, 0);
-          statsPdfCount.textContent = String(pdfCount);
+          statsPdfCount.textContent = String(entries.length);
           statsFolderCount.textContent = String(sourceFolders.length);
-          summary.textContent = `${pdfCount} PDFs found directly in the selected folder.`;
-          updateProgress(0, sourceFolders.length);
+          statsRenamedCount.textContent = '0';
+          summary.textContent = `${entries.length} PDFs uploaded. Originals are preserved.`;
+          updateProgress(0, entries.length);
         } catch (error) {
-          summary.textContent = `Could not choose main folder: ${error.message}`;
+          summary.textContent = `Could not upload PDFs: ${error.message}`;
+        } finally {
+          sourceButton.disabled = false;
+          pdfButton.disabled = false;
         }
+      }
+
+      sourceButton.addEventListener('click', () => folderInput.click());
+      pdfButton.addEventListener('click', () => pdfInput.click());
+      folderInput.addEventListener('change', () => {
+        if (folderInput.files.length) uploadFiles(folderInput.files, true);
+      });
+      pdfInput.addEventListener('change', () => {
+        if (pdfInput.files.length) uploadFiles(pdfInput.files, false);
       });
 
-      outputButton.addEventListener('click', async () => {
-        try {
-          summary.textContent = 'Select the save destination in the Windows folder picker.';
-          const response = await fetch('/choose-output', { method: 'POST' });
-          const result = await response.json();
-          if (!response.ok) throw new Error(result.error || 'Could not choose save destination.');
-          if (result.cancelled) {
-            summary.textContent = 'Folder selection canceled.';
-            return;
-          }
-          outputDirectory = result.path;
-          outputLocation.textContent = `Save location: ${outputDirectory}`;
-          summary.textContent = 'Save destination selected.';
-        } catch (error) {
-          summary.textContent = `Could not choose save destination: ${error.message}`;
+      async function showDownloads() {
+        if (!lastJobId) {
+          summary.textContent = 'Complete a rename or merge job before downloading results.';
+          return;
         }
-      });
+        try {
+          const result = await apiFetch(`/jobs/${lastJobId}/downloads`);
+          downloadList.replaceChildren();
+          result.downloads.forEach(download => {
+            const link = document.createElement('a');
+            link.href = download.url;
+            link.textContent = `Download ${download.filename}`;
+            link.rel = 'noopener';
+            link.target = '_blank';
+            downloadList.append(link, document.createElement('br'));
+          });
+          summary.textContent = result.downloads.length
+            ? `${result.downloads.length} secure download link(s) are ready.`
+            : 'This job has no downloadable PDF outputs.';
+        } catch (error) {
+          summary.textContent = `Could not load downloads: ${error.message}`;
+        }
+      }
+
+      outputButton.addEventListener('click', showDownloads);
 
       async function renamePdfs() {
         if (!sourceDirectory) {
-          summary.textContent = 'Choose a main folder first.';
+          summary.textContent = 'Upload a folder or select PDFs first.';
           return;
         }
-
-        const confirmed = window.confirm(
-          `Check and rename PDF files directly inside ${sourceDirectory} using the letter and number from each first page? Incorrect existing names will be corrected. Subfolders and the save destination will not be changed. Existing files will not be overwritten.`
-        );
-        if (!confirmed) return;
-
         const filenames = sourcePdfGroups.flatMap(group => group.pdf_files);
         if (!filenames.length) {
-          summary.textContent = 'No PDF files were found directly in the selected folder.';
+          summary.textContent = 'There are no PDFs directly in the uploaded folder to rename.';
           return;
         }
-
-        const folderName = sourceDirectory.split(/[\\/]/).pop();
-        const results = filenames.map(filename => ({ filename, status: 'pending' }));
-        startJob('rename');
-        updateProgress(0, filenames.length, filenames[0]);
-        renderPdfFiles([{
-          name: folderName,
-          is_root: true,
-          pdf_count: results.length,
-          results,
-        }]);
-        summary.textContent = `Reading PDFs directly in ${sourceDirectory}...`;
+        if (!window.confirm(`Create renamed copies for ${filenames.length} PDFs directly inside ${sourceRootName}? Original uploads will be preserved.`)) return;
         try {
-          for (let index = 0; index < filenames.length; index += 1) {
-            await waitWhilePaused();
-            if (stopRequested) break;
-
-            const filename = filenames[index];
-            updateProgress(index, filenames.length, filename);
-            summary.textContent = `Renaming ${index + 1} of ${filenames.length}: ${filename}`;
-            const response = await fetch('/rename-pdfs', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ filename }),
-            });
-            const result = await response.json();
-            if (!response.ok) throw new Error(result.error || `Could not rename ${filename}.`);
-
-            const fileResult = result.folders.flatMap(folder => folder.results)[0];
-            if (!fileResult) throw new Error(`No rename result was returned for ${filename}.`);
-            results[index] = fileResult;
-            const fileItems = renameFileList.querySelectorAll('.rename-file');
-            updatePdfFileItem(fileItems[index], fileResult, manualResult => {
-              results[index] = manualResult;
-              statsRenamedCount.textContent = String(
-                results.filter(item => item.status === 'renamed').length
-              );
-              sourcePdfGroups = sourcePdfGroups.map(group => group.is_root
-                ? { ...group, pdf_files: results.map(item => item.filename) }
-                : group);
-            });
-            updateProgress(index + 1, filenames.length);
-          }
-
-          const statuses = results.filter(item => item.status !== 'pending');
-          const renamed = statuses.filter(item => item.status === 'renamed').length;
-          statsRenamedCount.textContent = String(renamed);
-          const alreadyNamed = statuses.filter(item => item.status === 'unchanged').length;
-          const skipped = statuses.filter(item => item.status === 'skipped').length;
-          const failed = statuses.filter(item => item.status === 'failed').length;
-          summary.textContent = stopRequested
-            ? `Stopped. ${renamed} renamed, ${alreadyNamed} already named, ${skipped} skipped, ${failed} failed; remaining PDFs were not processed.`
-            : `Rename finished: ${renamed} renamed, ${alreadyNamed} already named, ${skipped} skipped, ${failed} failed. See each file below for details.`;
+          const queued = await apiFetch('/jobs', {
+            method: 'POST',
+            body: JSON.stringify({ workspace_id: sourceDirectory, kind: 'rename' }),
+          });
+          lastJobId = queued.job_id;
+          await runQueuedJob(queued.job_id, 'rename');
         } catch (error) {
           summary.textContent = `Could not rename PDFs: ${error.message}`;
-        } finally {
-          statsRenamedCount.textContent = String(
-            results.filter(item => item.status === 'renamed').length
-          );
-          sourcePdfGroups = sourcePdfGroups.map(group => group.is_root
-            ? { ...group, pdf_files: results.map(item => item.filename) }
-            : group);
-          finishJob();
-          dashboardJobStatus.textContent = 'Rename run finished';
         }
+      }
+
+      async function runQueuedJob(jobId, jobName) {
+        lastJobId = jobId;
+        sessionStorage.setItem('pdfWorkshopJob', JSON.stringify({ job_id: jobId, kind: jobName }));
+        startJob(jobName, jobId);
+        let job;
+        try {
+          while (true) {
+            job = await apiFetch(`/jobs/${jobId}`);
+            pauseRequested = job.status === 'paused';
+            stopRequested = job.status === 'stopping' || job.status === 'stopped';
+            updateJobControls();
+            updateProgress(job.completed || 0, job.total || 0);
+            progressText.textContent = job.current
+              ? `${jobName === 'rename' ? 'Renaming' : 'Merging'}: ${job.current}`
+              : `${job.completed || 0} of ${job.total || 0} ${jobName === 'rename' ? 'PDFs' : 'subfolders'} processed`;
+            if (jobName === 'rename' && job.results) {
+              renderPdfFiles([{
+                name: sourceRootName,
+                is_root: true,
+                pdf_count: job.results.length,
+                results: job.results,
+              }]);
+              statsRenamedCount.textContent = String(job.results.filter(result => result.status === 'renamed').length);
+            }
+            if (jobName === 'merge' && job.results) {
+              job.results.forEach(result => result.status === 'completed'
+                ? markFolderComplete(result.filename)
+                : result.status === 'failed' && markFolderFailed(result.filename, result.message));
+            }
+            if (['completed', 'failed', 'stopped'].includes(job.status)) break;
+            await new Promise(resolve => window.setTimeout(resolve, 1200));
+          }
+        } finally {
+          finishJob();
+        }
+        if (jobName === 'merge') {
+          const complete = (job.results || []).filter(result => result.status === 'completed').length;
+          const failed = (job.results || []).filter(result => result.status === 'failed').length;
+          const message = job.error
+            ? `Merge ${job.status}: ${job.error}`
+            : job.status === 'stopped'
+            ? `Stopped. ${complete} subfolders merged; originals remain unchanged.`
+            : `${complete} subfolders merged; ${failed} failed. Original PDFs were preserved.`;
+          summary.textContent = message;
+          completionTitle.textContent = failed ? 'Merge finished with skipped folders' : 'Merge completed';
+          completionMessage.textContent = message;
+          if (job.status !== 'stopped') completionDialog.showModal();
+        } else {
+          const results = job.results || [];
+          const renamed = results.filter(result => result.status === 'renamed').length;
+          const unchanged = results.filter(result => result.status === 'unchanged').length;
+          const skipped = results.filter(result => result.status === 'skipped').length;
+          const failed = results.filter(result => result.status === 'failed').length;
+          summary.textContent = job.error
+            ? `Rename ${job.status}: ${job.error}`
+            : `Rename ${job.status}: ${renamed} created, ${unchanged} already named, ${skipped} skipped, ${failed} failed.`;
+        }
+        return job;
       }
 
       renameButton.addEventListener('click', renamePdfs);
@@ -1497,79 +1586,59 @@ HTML_PAGE = """
 
       completionConfirm.addEventListener('click', () => {
         completionDialog.close();
-        clearDashboard();
       });
 
       mergeButton.addEventListener('click', async () => {
         if (!sourceDirectory || !sourceFolders.length) {
-          summary.textContent = 'Please choose a folder first.';
+          summary.textContent = 'Upload a folder containing PDF subfolders first.';
           return;
         }
-
-        if (!outputDirectory) {
-          summary.textContent = 'Choose an output folder first.';
-          return;
-        }
-
-        const confirmed = window.confirm(
-          `Merge ${sourceFolders.length} subfolders into separate PDFs in the save destination, then permanently delete each source subfolder and all its contents? This cannot be undone.`
-        );
+        const confirmed = window.confirm(`Merge PDFs from ${sourceFolders.length} subfolders into separate downloadable files? Originals will be preserved.`);
         if (!confirmed) return;
-
-        let processed = 0;
-        let completed = 0;
-        const failedFolders = [];
-        startJob('merge');
-        updateProgress(0, sourceFolders.length);
-
         try {
-          for (const folder of sourceFolders) {
-            await waitWhilePaused();
-            if (stopRequested) break;
-
-            const folderName = folder.name;
-            updateProgress(processed, sourceFolders.length, folderName, folder.pdf_count);
-            summary.textContent = `Merging PDFs in ${folderName}...`;
-            try {
-              const response = await fetch('/merge', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ folder_name: folderName }),
-              });
-              const result = await response.json();
-              if (!response.ok) throw new Error(result.error || `Could not merge ${folderName}`);
-
-              markFolderComplete(folderName);
-              completed += 1;
-              summary.textContent = `Saved ${completed} PDFs: ${result.filename}; deleted source folder ${folderName}.`;
-            } catch (error) {
-              failedFolders.push(folderName);
-              markFolderFailed(folderName, error.message);
-              summary.textContent = `Skipped ${folderName}: ${error.message}. Continuing with the next subfolder...`;
-            }
-
-            processed += 1;
-            updateProgress(processed, sourceFolders.length);
-          }
-
-          const finalSummary = stopRequested
-            ? `Stopped. ${completed} subfolders were merged and deleted; ${sourceFolders.length - processed} remain unprocessed.`
-            : failedFolders.length
-              ? `Finished: ${completed} merged, ${failedFolders.length} skipped (${failedFolders.join(', ')}). PDF errors leave their source folders untouched; review the red entries for details.`
-              : `Done. Saved ${completed} PDFs and removed their source subfolders.`;
-          summary.textContent = finalSummary;
-          dashboardJobStatus.textContent = stopRequested ? 'Merge stopped' : 'Merge run finished';
-          if (!stopRequested) {
-            completionTitle.textContent = failedFolders.length
-              ? 'Merge finished with skipped folders'
-              : 'Merge completed';
-            completionMessage.textContent = finalSummary;
-            completionDialog.showModal();
-          }
-        } finally {
-          finishJob();
+          const queued = await apiFetch('/jobs', {
+            method: 'POST',
+            body: JSON.stringify({ workspace_id: sourceDirectory, kind: 'merge' }),
+          });
+          lastJobId = queued.job_id;
+          await runQueuedJob(queued.job_id, 'merge');
+        } catch (error) {
+          summary.textContent = `Could not start merge: ${error.message}`;
         }
       });
+
+      async function restoreDashboard() {
+        const savedWorkspace = sessionStorage.getItem('pdfWorkshopWorkspace');
+        if (!savedWorkspace) return;
+        try {
+          const cached = JSON.parse(savedWorkspace);
+          const workspace = await apiFetch(`/workspaces/${cached.workspace_id}`);
+          sourceDirectory = workspace.workspace_id;
+          sourceRootName = workspace.root_name;
+          sourceFolders = workspace.folders;
+          sourcePdfGroups = workspace.root_files.length ? [{
+            name: sourceRootName,
+            is_root: true,
+            pdf_count: workspace.root_files.length,
+            pdf_files: workspace.root_files,
+          }] : [];
+          sourceLocation.textContent = `Source: ${sourceRootName} (${workspace.file_count} PDFs)`;
+          statsPdfCount.textContent = String(workspace.file_count);
+          statsFolderCount.textContent = String(sourceFolders.length);
+          renderFolders(sourceFolders);
+          renderPdfFiles(sourcePdfGroups);
+          const savedJob = sessionStorage.getItem('pdfWorkshopJob');
+          if (savedJob) {
+            const job = JSON.parse(savedJob);
+            lastJobId = job.job_id;
+            await runQueuedJob(job.job_id, job.kind);
+          }
+        } catch (error) {
+          summary.textContent = `Could not restore the cloud workspace: ${error.message}`;
+        }
+      }
+
+      restoreDashboard();
     </script>
   </body>
 </html>
@@ -1578,16 +1647,28 @@ HTML_PAGE = """
 
 def merge_pdf_files(pdf_files: list[Path]) -> bytes:
     writer = PdfWriter()
-    for pdf_file in sorted(pdf_files, key=lambda item: item.name.lower()):
-        reader = PdfReader(str(pdf_file))
-        for page in reader.pages:
-            writer.add_page(page)
+    for pdf_file in sorted(pdf_files, key=lambda item: natural_sort_key(item.name)):
+      reader = PdfReader(str(pdf_file))
+      for page in reader.pages:
+        writer.add_page(page)
     output = BytesIO()
     writer.write(output)
     return output.getvalue()
 
 
+def merge_pdf_files_to_path(pdf_files: list[Path], output_path: Path) -> None:
+    writer = PdfWriter()
+    for pdf_file in sorted(pdf_files, key=lambda item: natural_sort_key(item.name)):
+        reader = PdfReader(str(pdf_file))
+        for page in reader.pages:
+            writer.add_page(page)
+    with output_path.open("wb") as output:
+        writer.write(output)
+
+
 def _dark_components(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    import numpy as np
+
     visited = np.zeros(mask.shape, dtype=bool)
     components = []
     height, width = mask.shape
@@ -1624,6 +1705,8 @@ def _entry_letter_from_image(
     number_left: float,
     engine: RapidOCR,
 ) -> str:
+    import numpy as np
+
     _, number_top, _, number_bottom = number_box
     number_height = number_bottom - number_top
     number_center = (number_top + number_bottom) / 2
@@ -1707,6 +1790,9 @@ def _entry_letter_from_image(
 
 
 def _declaration_identifier_from_first_page(pdf_path: Path, engine: RapidOCR) -> str | None:
+    import fitz
+    import numpy as np
+
     with fitz.open(pdf_path) as document:
         if not document:
             return None
@@ -1775,54 +1861,89 @@ def _declaration_identifier_from_first_page(pdf_path: Path, engine: RapidOCR) ->
 
 
 def _report_identifier_from_pdf(pdf_path: Path, engine: RapidOCR) -> str | None:
+    import fitz
+    import numpy as np
+
     matching_candidates = []
     report_pattern = re.compile(
-        r"\bPNH02\b.{0,40}?\b20\d{2}\b.{0,20}?\b[I1|]\s*(\d{1,8})\b",
-        re.IGNORECASE,
+      r"\bPNH02\b.{0,40}?\b20\d{2}\b.{0,20}?\b[I1|]\s*(\d{1,8})\b",
+      re.IGNORECASE,
     )
 
     with fitz.open(pdf_path) as document:
-        if not document:
-            return None
-        for page_number, page in enumerate(document):
-            report_region = fitz.Rect(
-                page.rect.width * 0.25,
-                page.rect.height * 0.25,
-                page.rect.width * 0.80,
-                page.rect.height * 0.42,
-            )
-            pixmap = page.get_pixmap(
-                matrix=fitz.Matrix(4, 4),
-                clip=report_region,
-                alpha=False,
-            )
-            image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
-                pixmap.height, pixmap.width, pixmap.n
-            )
-            results, _ = engine(image, use_cls=False)
-            for _, text, confidence in results or []:
-                match = report_pattern.search(text)
-                if match and float(confidence) >= 0.75:
-                    matching_candidates.append((
-                        page_number,
-                        float(confidence),
-                        match.group(1),
-                    ))
+      if not document:
+        return None
+      for page_number in range(min(1, len(document))):
+        page = document[page_number]
+        report_region = fitz.Rect(
+          page.rect.width * 0.25,
+          page.rect.height * 0.25,
+          page.rect.width * 0.80,
+          page.rect.height * 0.42,
+        )
+        pixmap = page.get_pixmap(
+          matrix=fitz.Matrix(4, 4),
+          clip=report_region,
+          alpha=False,
+        )
+        image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
+          pixmap.height, pixmap.width, pixmap.n
+        )
+        results, _ = engine(image, use_cls=False)
+        for _, text, confidence in results or []:
+          match = report_pattern.search(text)
+          if match and float(confidence) >= 0.75:
+            matching_candidates.append((
+              page_number,
+              float(confidence),
+              match.group(1),
+            ))
 
     if not matching_candidates:
-        return None
+      return None
     _, _, number = min(
-        matching_candidates,
-        key=lambda candidate: (candidate[0], -candidate[1]),
+      matching_candidates,
+      key=lambda candidate: (candidate[0], -candidate[1]),
     )
     return f"I {number}"
 
 
 def pdf_identifier_from_first_page(pdf_path: Path) -> str:
     global ocr_engine
+    import fitz
+    import numpy as np
+
+    with fitz.open(pdf_path) as document:
+        if not document:
+            raise ValueError("PDF has no pages.")
+        first_page_text = document[0].get_text("text")
+
+    report_text_match = re.search(
+        r"\bPNH02\b.{0,40}?\b20\d{2}\b.{0,20}?\b[I1|]\s*(\d{1,8})\b",
+        first_page_text,
+        re.IGNORECASE,
+    )
+    if report_text_match:
+        return f"I {report_text_match.group(1)}"
+    entry_text_match = re.search(
+        r"\bEntry\s+(?:No\.?|Number)\s*[:#-]?\s*([A-Z])\s*(\d{1,8})\b",
+        first_page_text,
+        re.IGNORECASE,
+    )
+    if entry_text_match:
+        return f"{entry_text_match.group(1).upper()} {entry_text_match.group(2)}"
+    declaration_text_match = re.search(
+        r"\bdeclaration\b.{0,80}?\b([A-Z])\s*(\d{1,8})\b",
+        first_page_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if declaration_text_match:
+        return f"{declaration_text_match.group(1).upper()} {declaration_text_match.group(2)}"
 
     engine = ocr_engine
     if engine is None:
+        from rapidocr_onnxruntime import RapidOCR
+
         engine = RapidOCR(intra_op_num_threads=2)
         ocr_engine = engine
 
@@ -1950,253 +2071,556 @@ def index():
     return render_template_string(HTML_PAGE)
 
 
+@app.get("/favicon.ico")
+def favicon():
+  return "", 204
+
+
 def natural_sort_key(name: str) -> list[object]:
-  return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", name)]
+  return [
+    (1, int(part)) if part.isdigit() else (0, part.casefold())
+    for part in re.split(r"(\d+)", name)
+  ]
 
 
-def folders_with_pdfs(directory: Path) -> list[dict[str, str | int | list[str]]]:
-  folders = []
-  for folder in directory.iterdir():
-    if not folder.is_dir():
-      continue
-    pdf_files = sorted(
-      (
-        item.name for item in folder.iterdir()
-        if item.is_file() and item.suffix.lower() == ".pdf"
-      ),
-      key=str.casefold,
-    )
-    if pdf_files:
-      folders.append({
-        "name": folder.name,
-        "pdf_count": len(pdf_files),
-        "pdf_files": pdf_files,
-      })
-  return sorted(folders, key=lambda folder: natural_sort_key(str(folder["name"])))
+def _cloud_is_configured() -> bool:
+  return all(os.getenv(name) for name in ("AWS_S3_BUCKET", "AWS_DYNAMODB_TABLE", "AWS_SQS_QUEUE_URL"))
 
 
-def pdf_files_in_directory(directory: Path) -> list[Path]:
-  return sorted(
-    (
-      item for item in directory.iterdir()
-      if item.is_file() and item.suffix.lower() == ".pdf"
-    ),
-    key=lambda item: item.name.casefold(),
-  )
+@lru_cache(maxsize=3)
+def _aws_client(service: str):
+  import boto3
+
+  return boto3.client(service, region_name=os.getenv("AWS_REGION", "us-east-1"))
 
 
-@app.post("/choose-source")
-def choose_source():
-  global source_directory
+@lru_cache(maxsize=1)
+def _dynamodb_table():
+  import boto3
 
-  import tkinter as tk
-  from tkinter import filedialog
+  resource = boto3.resource("dynamodb", region_name=os.getenv("AWS_REGION", "us-east-1"))
+  return resource.Table(os.environ["AWS_DYNAMODB_TABLE"])
 
-  root = None
+
+def _require_cloud():
+  if not _cloud_is_configured():
+    raise RuntimeError("Cloud services are not configured. Set AWS_S3_BUCKET, AWS_DYNAMODB_TABLE, and AWS_SQS_QUEUE_URL.")
+
+
+def _bucket() -> str:
+  _require_cloud()
+  return os.environ["AWS_S3_BUCKET"]
+
+
+@app.before_request
+def require_api_token():
+  if request.endpoint == "index":
+    return None
+  expected = os.getenv("PDF_WORKSHOP_ACCESS_TOKEN", "")
+  supplied = request.headers.get("Authorization", "")
+  if not expected:
+    return jsonify({"error": "PDF_WORKSHOP_ACCESS_TOKEN is not configured."}), 503
+  if not supplied.startswith("Bearer ") or not hmac.compare_digest(supplied[7:], expected):
+    return jsonify({"error": "Authentication required."}), 401
+  if not _cloud_is_configured():
+    return jsonify({"error": "Cloud storage, job table, and queue are not configured."}), 503
+  return None
+
+
+@app.errorhandler(413)
+def request_too_large(_error):
+  return jsonify({"error": "Request metadata exceeds the configured limit. PDF bytes must be uploaded directly to cloud storage."}), 413
+
+
+def _jsonable(value):
+  if isinstance(value, Decimal):
+    return int(value) if value % 1 == 0 else float(value)
+  if isinstance(value, list):
+    return [_jsonable(item) for item in value]
+  if isinstance(value, dict):
+    return {key: _jsonable(item) for key, item in value.items()}
+  return value
+
+
+def _safe_relative_path(value: object) -> str:
+  if not isinstance(value, str) or not value:
+    raise ValueError("Invalid relative PDF path.")
   try:
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    selected_path = filedialog.askdirectory(
-      parent=root,
-      title="Choose the main folder containing PDF subfolders",
-      mustexist=True,
+    if len(value.encode("utf-8")) > 200:
+      raise ValueError("PDF paths must use at most 200 UTF-8 bytes.")
+  except UnicodeEncodeError as error:
+    raise ValueError("Invalid relative PDF path.") from error
+  normalized = value.replace("\\", "/")
+  path = PurePosixPath(normalized)
+  if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+    raise ValueError("Invalid relative PDF path.")
+  if ":" in path.parts[0] or any(ord(char) < 32 for char in normalized):
+    raise ValueError("Invalid relative PDF path.")
+  if path.suffix.casefold() != ".pdf":
+    raise ValueError("Only PDF files can be uploaded.")
+  return path.as_posix()
+
+
+def _workspace(workspace_id: str) -> dict:
+  _require_cloud()
+  try:
+    uuid.UUID(workspace_id)
+  except (ValueError, TypeError, AttributeError):
+    raise ValueError("Invalid workspace ID.")
+  response = _dynamodb_table().get_item(Key={"id": f"workspace:{workspace_id}"})
+  item = response.get("Item")
+  if not item:
+    raise LookupError("Workspace not found.")
+  return item
+
+
+def _group_workspace_files(files: list[dict]) -> tuple[list[dict], list[dict]]:
+  root_files = []
+  grouped: dict[str, list[str]] = {}
+  for item in files:
+    relative = PurePosixPath(item["relative_path"])
+    if relative.parent == PurePosixPath("."):
+      root_files.append(item)
+    else:
+      grouped.setdefault(relative.parent.as_posix(), []).append(relative.name)
+  folders = [
+    {"name": name, "pdf_count": len(names), "pdf_files": sorted(names, key=natural_sort_key)}
+    for name, names in grouped.items()
+  ]
+  folders.sort(key=lambda folder: natural_sort_key(folder["name"]))
+  root_files.sort(key=lambda item: natural_sort_key(item["relative_path"]))
+  return folders, root_files
+
+
+@app.post("/workspaces")
+def create_workspace():
+  data = request.get_json(silent=True) or {}
+  incoming_files = data.get("files")
+  root_name = data.get("root_name", "Uploaded PDFs")
+  if not isinstance(incoming_files, list) or not incoming_files or len(incoming_files) > MAX_WORKSPACE_FILES:
+    return jsonify({"error": f"Select between 1 and {MAX_WORKSPACE_FILES} PDF files."}), 400
+  if not isinstance(root_name, str) or len(root_name) > 160:
+    return jsonify({"error": "Invalid folder name."}), 400
+
+  files = []
+  seen_paths = set()
+  total_bytes = 0
+  try:
+    for incoming in incoming_files:
+      relative_path = _safe_relative_path(incoming.get("relative_path") if isinstance(incoming, dict) else None)
+      size = incoming.get("size") if isinstance(incoming, dict) else None
+      if not isinstance(size, int) or isinstance(size, bool) or size <= 0 or size > MAX_PDF_BYTES:
+        raise ValueError(f"Invalid or oversized PDF: {relative_path}.")
+      normalized_key = relative_path.casefold()
+      if normalized_key in seen_paths:
+        raise ValueError(f"Duplicate file path: {relative_path}.")
+      seen_paths.add(normalized_key)
+      total_bytes += size
+      if total_bytes > MAX_WORKSPACE_BYTES:
+        raise ValueError("Selected PDFs exceed the configured workspace size limit.")
+      files.append({"relative_path": relative_path, "size": size})
+  except (AttributeError, ValueError) as error:
+    return jsonify({"error": str(error)}), 400
+
+  workspace_id = str(uuid.uuid4())
+  bucket = _bucket()
+  s3 = _aws_client("s3")
+  uploads = []
+  for item in files:
+    item["key"] = f"pdf-workshop/{workspace_id}/source/{item['relative_path']}"
+    item["filename"] = PurePosixPath(item["relative_path"]).name
+    presigned_post = s3.generate_presigned_post(
+      Bucket=bucket,
+      Key=item["key"],
+      Fields={"Content-Type": "application/pdf"},
+      Conditions=[
+        {"Content-Type": "application/pdf"},
+        ["content-length-range", 1, item["size"]],
+      ],
+      ExpiresIn=3600,
     )
-  except Exception:
-    app.logger.exception("Could not open the Windows source folder picker")
-    return jsonify({"error": "Could not open the Windows folder picker."}), 500
-  finally:
-    if root is not None:
-      root.destroy()
-
-  if not selected_path:
-    return jsonify({"cancelled": True})
-
-  source_directory = Path(selected_path)
-  pdf_files = pdf_files_in_directory(source_directory)
+    uploads.append({"relative_path": item["relative_path"], **presigned_post})
+  folders, root_files = _group_workspace_files(files)
+  item = {
+    "id": f"workspace:{workspace_id}",
+    "workspace_id": workspace_id,
+    "root_name": root_name,
+    "files": files,
+    "created_at": int(time.time()),
+    "expires_at": int(time.time()) + 7 * 24 * 60 * 60,
+  }
+  _dynamodb_table().put_item(Item=item, ConditionExpression="attribute_not_exists(id)")
   return jsonify({
-    "path": str(source_directory),
-    "pdf_groups": [{
-      "name": source_directory.name,
-      "is_root": True,
-      "pdf_count": len(pdf_files),
-      "pdf_files": [item.name for item in pdf_files],
-    }] if pdf_files else [],
-    "folders": folders_with_pdfs(source_directory),
+    "workspace_id": workspace_id,
+    "root_name": root_name,
+    "uploads": uploads,
+    "files": [{"relative_path": file["relative_path"], "filename": file["filename"]} for file in files],
+    "folders": folders,
+    "root_files": [file["filename"] for file in root_files],
+  }), 201
+
+
+@app.get("/workspaces/<workspace_id>")
+def get_workspace(workspace_id: str):
+  try:
+    workspace = _workspace(workspace_id)
+  except ValueError as error:
+    return jsonify({"error": str(error)}), 400
+  except LookupError as error:
+    return jsonify({"error": str(error)}), 404
+  folders, root_files = _group_workspace_files(workspace["files"])
+  return jsonify({
+    "workspace_id": workspace_id,
+    "root_name": workspace["root_name"],
+    "folders": folders,
+    "root_files": [file["filename"] for file in root_files],
+    "file_count": len(workspace["files"]),
   })
 
 
-@app.post("/choose-output")
-def choose_output():
-    global output_directory
-
-    import tkinter as tk
-    from tkinter import filedialog
-
-    root = None
+def _queue_job(workspace_id: str, kind: str, manual_file: str | None = None, identifier: str | None = None) -> dict:
+  workspace = _workspace(workspace_id)
+  job_id = str(uuid.uuid4())
+  table = _dynamodb_table()
+  table.update_item(
+    Key={"id": f"workspace:{workspace_id}"},
+    UpdateExpression="SET active_job = :job, active_job_until = :lease",
+    ConditionExpression="attribute_not_exists(active_job) OR active_job_until < :now",
+    ExpressionAttributeValues={":job": job_id, ":lease": int(time.time()) + 24 * 60 * 60, ":now": int(time.time())},
+  )
+  job = {
+    "id": f"job:{job_id}",
+    "job_id": job_id,
+    "workspace_id": workspace_id,
+    "kind": kind,
+    "status": "queued",
+    "created_at": int(time.time()),
+    "expires_at": int(time.time()) + 7 * 24 * 60 * 60,
+    "completed": 0,
+    "total": 0,
+    "results": [],
+  }
+  if manual_file is not None:
+    job["manual_file"] = manual_file
+    job["identifier"] = identifier
+  try:
+    table.put_item(Item=job, ConditionExpression="attribute_not_exists(id)")
+    _aws_client("sqs").send_message(
+      QueueUrl=os.environ["AWS_SQS_QUEUE_URL"],
+      MessageBody=json.dumps({"job_id": job_id}),
+    )
+  except Exception:
     try:
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        selected_path = filedialog.askdirectory(
-            parent=root,
-            title="Choose where merged PDFs will be saved",
-            mustexist=True,
-        )
+      table.delete_item(Key={"id": f"job:{job_id}"})
     except Exception:
-        app.logger.exception("Could not open the Windows folder picker")
-        return jsonify({"error": "Could not open the Windows folder picker."}), 500
-    finally:
-        if root is not None:
-            root.destroy()
-
-    if not selected_path:
-        return jsonify({"cancelled": True})
-
-    output_directory = Path(selected_path)
-    return jsonify({"path": str(output_directory)})
+      app.logger.exception("Could not clean up failed job record %s", job_id)
+    table.update_item(
+      Key={"id": f"workspace:{workspace_id}"},
+      UpdateExpression="REMOVE active_job, active_job_until",
+      ConditionExpression="active_job = :job",
+      ExpressionAttributeValues={":job": job_id},
+    )
+    raise
+  return job
 
 
-@app.post("/rename-pdfs")
-def rename_pdfs():
-    if source_directory is None or not source_directory.is_dir():
-        return jsonify({"error": "Choose an existing main folder first."}), 400
-
-    requested_filename = request.json.get("filename") if request.is_json else None
-    requested_identifier = request.json.get("identifier") if request.is_json else None
-    if request.is_json and "filename" in request.json:
-        if (
-            not isinstance(requested_filename, str)
-            or Path(requested_filename).name != requested_filename
-            or "/" in requested_filename
-            or "\\" in requested_filename
-            or Path(requested_filename).suffix.lower() != ".pdf"
-        ):
-            return jsonify({"error": "Invalid PDF filename."}), 400
-    if request.is_json and "identifier" in request.json:
-        if not isinstance(requested_identifier, str):
-            return jsonify({"error": "Invalid PDF identifier. Use one letter and a 1- to 8-digit ID."}), 400
-        identifier_match = re.fullmatch(
-            r"\s*([A-Za-z])\s*(\d{1,8})\s*",
-            requested_identifier,
-        )
-        if not identifier_match:
-            return jsonify({"error": "Invalid PDF identifier. Use one letter and a 1- to 8-digit ID."}), 400
-        requested_identifier = f"{identifier_match.group(1).upper()} {identifier_match.group(2)}"
-
-    try:
-        if requested_filename is None:
-            pdf_files = pdf_files_in_directory(source_directory)
-        else:
-            selected_pdf = source_directory / requested_filename
-            if (
-                not selected_pdf.is_file()
-                or selected_pdf.resolve().parent != source_directory.resolve()
-            ):
-                return jsonify({"error": "The selected PDF was not found in the main folder."}), 404
-            pdf_files = [selected_pdf]
-    except OSError as error:
-        app.logger.exception("Could not list PDFs in %s", source_directory)
-        return jsonify({"error": f"Could not read the selected folder: {error}"}), 500
-
-    results = []
-    for pdf_file in pdf_files:
-        try:
-            identifier = requested_identifier or pdf_identifier_from_first_page(pdf_file)
-            target_path = pdf_file.with_name(f"{identifier}.pdf")
-            if target_path.name.casefold() == pdf_file.name.casefold():
-                results.append({
-                    "filename": pdf_file.name,
-                    "status": "unchanged",
-                    "message": "Filename matches the ID on the first page",
-                })
-            elif target_path.exists():
-                results.append({
-                    "filename": pdf_file.name,
-                    "status": "skipped",
-                    "message": f"{target_path.name} already exists",
-                })
-            else:
-                pdf_file.rename(target_path)
-                results.append({
-                    "filename": target_path.name,
-                    "status": "renamed",
-                    "message": f"from {pdf_file.name}",
-                })
-        except ValueError as error:
-            app.logger.warning("Could not identify PDF filename for %s: %s", pdf_file, error)
-            results.append({
-                "filename": pdf_file.name,
-                "status": "failed",
-                "message": str(error),
-            })
-        except Exception as error:
-            app.logger.exception("Could not rename PDF %s", pdf_file)
-            results.append({
-                "filename": pdf_file.name,
-                "status": "failed",
-                "message": str(error),
-            })
-
-    total = len(results)
-    return jsonify({
-        "total": total,
-        "renamed": sum(result["status"] == "renamed" for result in results),
-        "folders": [{
-            "name": source_directory.name,
-            "is_root": True,
-            "pdf_count": total,
-            "results": results,
-        }] if results else [],
-    })
+@app.post("/jobs")
+def create_job():
+  data = request.get_json(silent=True) or {}
+  workspace_id = data.get("workspace_id")
+  kind = data.get("kind")
+  if kind not in {"rename", "merge"}:
+    return jsonify({"error": "Job kind must be rename or merge."}), 400
+  try:
+    job = _queue_job(workspace_id, kind)
+  except ValueError as error:
+    return jsonify({"error": str(error)}), 400
+  except LookupError as error:
+    return jsonify({"error": str(error)}), 404
+  except Exception as error:
+    app.logger.exception("Could not queue %s job", kind)
+    error_code = getattr(error, "response", {}).get("Error", {}).get("Code")
+    if error_code == "ConditionalCheckFailedException":
+      return jsonify({"error": "A job is already active for this workspace."}), 409
+    return jsonify({"error": "Could not queue the job. Check cloud service configuration."}), 503
+  return jsonify({"job_id": job["job_id"], "status": job["status"]}), 202
 
 
-@app.post("/merge")
-def merge():
-    if source_directory is None or not source_directory.is_dir():
-        return jsonify({"error": "Choose an existing main folder first."}), 400
+@app.post("/jobs/manual-rename")
+def create_manual_rename_job():
+  data = request.get_json(silent=True) or {}
+  workspace_id = data.get("workspace_id")
+  try:
+    relative_path = _safe_relative_path(data.get("relative_path"))
+  except ValueError as error:
+    return jsonify({"error": str(error)}), 400
+  match = re.fullmatch(r"\s*([A-Za-z])\s*(\d{1,8})\s*", str(data.get("identifier", "")))
+  if not match:
+    return jsonify({"error": "Enter one letter followed by a 1- to 8-digit ID."}), 400
+  try:
+    workspace = _workspace(workspace_id)
+    if not any(file["relative_path"] == relative_path for file in workspace["files"]):
+      return jsonify({"error": "The selected PDF is not in this workspace."}), 404
+    job = _queue_job(workspace_id, "manual", relative_path, f"{match.group(1).upper()} {match.group(2)}")
+  except ValueError as error:
+    return jsonify({"error": str(error)}), 400
+  except LookupError as error:
+    return jsonify({"error": str(error)}), 404
+  except Exception as error:
+    app.logger.exception("Could not queue manual rename")
+    error_code = getattr(error, "response", {}).get("Error", {}).get("Code")
+    if error_code == "ConditionalCheckFailedException":
+      return jsonify({"error": "A job is already active for this workspace."}), 409
+    return jsonify({"error": "Could not queue manual rename. Check cloud service configuration."}), 503
+  return jsonify({"job_id": job["job_id"], "status": job["status"]}), 202
 
-    if output_directory is None or not output_directory.is_dir():
-        return jsonify({"error": "Choose an existing save destination first."}), 400
 
-    folder_name = request.json.get("folder_name", "") if request.is_json else ""
-    if not folder_name or Path(folder_name).name != folder_name or "/" in folder_name or "\\" in folder_name:
-        return jsonify({"error": "Invalid subdirectory name."}), 400
+@app.get("/jobs/<job_id>")
+def get_job(job_id: str):
+  try:
+    uuid.UUID(job_id)
+  except ValueError:
+    return jsonify({"error": "Invalid job ID."}), 400
+  _require_cloud()
+  response = _dynamodb_table().get_item(Key={"id": f"job:{job_id}"})
+  job = response.get("Item")
+  if not job:
+    return jsonify({"error": "Job not found."}), 404
+  return jsonify(_jsonable({key: value for key, value in job.items() if key != "id"}))
 
-    source_folder = source_directory / folder_name
-    if not source_folder.is_dir() or source_folder.resolve().parent != source_directory.resolve():
-        return jsonify({"error": "The selected source subfolder was not found."}), 404
-    if source_folder.resolve() in output_directory.resolve().parents or output_directory.resolve() == source_folder.resolve():
-      return jsonify({"error": "The save destination cannot be inside the source subfolder being deleted."}), 400
 
-    pdf_files = [
-        item for item in source_folder.iterdir()
-        if item.is_file() and item.suffix.lower() == ".pdf"
+@app.post("/jobs/<job_id>/control")
+def control_job(job_id: str):
+  data = request.get_json(silent=True) or {}
+  action = data.get("action")
+  target_status = {"pause": "paused", "resume": "running", "stop": "stopping"}.get(action)
+  if not target_status:
+    return jsonify({"error": "Action must be pause, resume, or stop."}), 400
+  response = _dynamodb_table().get_item(Key={"id": f"job:{job_id}"})
+  job = response.get("Item")
+  if not job:
+    return jsonify({"error": "Job not found."}), 404
+  if job["status"] in {"completed", "failed", "stopped"}:
+    return jsonify({"error": "This job has already finished."}), 409
+  _dynamodb_table().update_item(
+    Key={"id": f"job:{job_id}"},
+    UpdateExpression="SET #status = :status",
+    ExpressionAttributeNames={"#status": "status"},
+    ExpressionAttributeValues={":status": target_status},
+  )
+  return jsonify({"status": target_status})
+
+
+@app.get("/jobs/<job_id>/downloads")
+def job_downloads(job_id: str):
+  response = _dynamodb_table().get_item(Key={"id": f"job:{job_id}"})
+  job = response.get("Item")
+  if not job:
+    return jsonify({"error": "Job not found."}), 404
+  downloads = []
+  for result in job.get("results", []):
+    if result.get("output_key"):
+      downloads.append({
+        "filename": result.get("output_filename", result["filename"]),
+        "status": result["status"],
+        "url": _aws_client("s3").generate_presigned_url(
+          "get_object",
+          Params={
+            "Bucket": _bucket(),
+            "Key": result["output_key"],
+            "ResponseContentDisposition": "attachment; filename=\"" + re.sub(r"[^A-Za-z0-9._ -]", "_", result.get("output_filename", result["filename"])) + "\"",
+          },
+          ExpiresIn=600,
+        ),
+      })
+  return jsonify({"downloads": downloads})
+
+
+def _update_job(job_id: str, **values) -> None:
+  names = {"#" + key: key for key in values}
+  expression_values = {":" + key: value for key, value in values.items()}
+  assignments = ", ".join(f"#{key} = :{key}" for key in values)
+  _dynamodb_table().update_item(
+    Key={"id": f"job:{job_id}"},
+    UpdateExpression=f"SET {assignments}",
+    ExpressionAttributeNames=names,
+    ExpressionAttributeValues=expression_values,
+  )
+
+
+def _worker_should_continue(job_id: str) -> bool:
+  while True:
+    response = _dynamodb_table().get_item(Key={"id": f"job:{job_id}"})
+    job = response.get("Item")
+    if not job or job["status"] in {"stopping", "stopped", "failed", "completed"}:
+      return False
+    if job["status"] != "paused":
+      return True
+    time.sleep(2)
+
+
+def _release_workspace(workspace_id: str, job_id: str) -> None:
+  try:
+    _dynamodb_table().update_item(
+      Key={"id": f"workspace:{workspace_id}"},
+      UpdateExpression="REMOVE active_job, active_job_until",
+      ConditionExpression="active_job = :job",
+      ExpressionAttributeValues={":job": job_id},
+    )
+  except Exception:
+    app.logger.exception("Could not release active-job lock for workspace %s", workspace_id)
+
+
+def _worker_record(job_id: str, results: list[dict], completed: int, total: int, current: str = "") -> None:
+  _update_job(job_id, results=results, completed=completed, total=total, current=current)
+
+
+def _download_validated_pdf(file: dict, local_path: Path, bucket: str) -> None:
+  s3 = _aws_client("s3")
+  head = s3.head_object(Bucket=bucket, Key=file["key"])
+  if head.get("ContentLength") != file["size"]:
+    raise ValueError(f"Upload is incomplete or changed: {file['relative_path']}.")
+  s3.download_file(bucket, file["key"], str(local_path))
+  with local_path.open("rb") as source_file:
+    if source_file.read(5) != b"%PDF-":
+      raise ValueError(f"{file['relative_path']} is not a valid PDF.")
+
+
+def process_job(job_id: str) -> None:
+  table = _dynamodb_table()
+  job_response = table.get_item(Key={"id": f"job:{job_id}"})
+  job = job_response.get("Item")
+  if not job or job["status"] in {"completed", "stopped", "failed"}:
+    return
+  workspace = _workspace(job["workspace_id"])
+  files = workspace["files"]
+  if job["kind"] in {"rename", "manual"}:
+    candidates = [
+      item for item in files
+      if PurePosixPath(item["relative_path"]).parent == PurePosixPath(".")
+      and (job["kind"] != "manual" or item["relative_path"] == job.get("manual_file"))
     ]
-    if not pdf_files:
-        return jsonify({"error": "No PDFs remain in this source subfolder."}), 400
+  else:
+    by_folder: dict[str, list[dict]] = {}
+    for item in files:
+      parent = PurePosixPath(item["relative_path"]).parent
+      if parent != PurePosixPath("."):
+        by_folder.setdefault(parent.as_posix(), []).append(item)
+    candidates = [
+      {"folder": name, "files": sorted(group, key=lambda item: natural_sort_key(item["relative_path"]))}
+      for name, group in sorted(by_folder.items(), key=lambda pair: natural_sort_key(pair[0]))
+    ]
 
+  total = len(candidates)
+  results: list[dict] = []
+  initial = table.get_item(Key={"id": f"job:{job_id}"}).get("Item", {})
+  if initial.get("status") == "queued":
     try:
-        merged_pdf = merge_pdf_files(pdf_files)
-    except Exception as error:
-      app.logger.exception("Could not read or merge PDFs in %s", folder_name)
-      return jsonify({"error": f"PDF merge failed in {folder_name}; source folder was left untouched: {error}"}), 422
+      table.update_item(
+        Key={"id": f"job:{job_id}"},
+        UpdateExpression="SET #status = :running, total = :total",
+        ConditionExpression="#status = :queued",
+        ExpressionAttributeNames={"#status": "status"},
+        ExpressionAttributeValues={":running": "running", ":queued": "queued", ":total": total},
+      )
+    except Exception:
+      pass
+  _worker_record(job_id, results, 0, total)
+  bucket = _bucket()
+  prefix = f"pdf-workshop/{job['workspace_id']}/results/{job_id}"
 
-    try:
-        output_path = output_directory / f"{folder_name}.pdf"
-        output_path.write_bytes(merged_pdf)
-    except Exception as error:
-      app.logger.exception("Could not save merged PDF for %s", folder_name)
-      return jsonify({"error": f"Could not save {folder_name}.pdf; source folder was left untouched: {error}"}), 500
+  try:
+    with tempfile.TemporaryDirectory(prefix="pdf-workshop-") as temporary_directory:
+      temp_root = Path(temporary_directory)
+      for index, candidate in enumerate(candidates):
+        if not _worker_should_continue(job_id):
+          break
+        if job["kind"] in {"rename", "manual"}:
+          file = candidate
+          filename = PurePosixPath(file["relative_path"]).name
+          local_path = temp_root / f"source-{index}.pdf"
+          try:
+            _download_validated_pdf(file, local_path, bucket)
+            identifier = job.get("identifier") if job["kind"] == "manual" else pdf_identifier_from_first_page(local_path)
+            if not identifier:
+              raise ValueError("No document ID was detected on the first page.")
+            target_name = f"{identifier}.pdf"
+            existing_names = {
+              result.get("output_filename", "").casefold()
+              for result in results if result.get("status") in {"renamed", "unchanged"}
+            }
+            if target_name.casefold() in existing_names:
+              result = {"filename": filename, "relative_path": file["relative_path"], "status": "skipped", "message": f"{target_name} is already assigned to another PDF."}
+            else:
+              output_key = f"{prefix}/renamed/{target_name}"
+              _aws_client("s3").upload_file(str(local_path), bucket, output_key, ExtraArgs={"ContentType": "application/pdf"})
+              result = {
+                "filename": filename,
+                "relative_path": file["relative_path"],
+                "output_filename": target_name,
+                "output_key": output_key,
+                "status": "unchanged" if target_name.casefold() == filename.casefold() else "renamed",
+                "message": "Original preserved; processed copy is available to download.",
+              }
+          except Exception as error:
+            app.logger.exception("Could not process PDF %s", file["relative_path"])
+            result = {"filename": filename, "relative_path": file["relative_path"], "status": "failed", "message": str(error)}
+          results.append(result)
+          _worker_record(job_id, results, index + 1, total, filename)
+        else:
+          folder = candidate["folder"]
+          local_files = []
+          try:
+            for file_index, file in enumerate(candidate["files"]):
+              local_path = temp_root / f"merge-{index}-{file_index}.pdf"
+              _download_validated_pdf(file, local_path, bucket)
+              local_files.append(local_path)
+            output_path = temp_root / f"merged-{index}.pdf"
+            merge_pdf_files_to_path(local_files, output_path)
+            output_filename = f"{PurePosixPath(folder).name}.pdf"
+            output_key = f"{prefix}/merged/{folder}.pdf"
+            _aws_client("s3").upload_file(str(output_path), bucket, output_key, ExtraArgs={"ContentType": "application/pdf"})
+            result = {"filename": folder, "output_filename": output_filename, "output_key": output_key, "status": "completed", "message": f"Merged {len(local_files)} PDFs; originals preserved."}
+          except Exception as error:
+            app.logger.exception("Could not merge PDF folder %s", folder)
+            result = {"filename": folder, "status": "failed", "message": str(error)}
+          results.append(result)
+          _worker_record(job_id, results, index + 1, total, folder)
 
-    try:
-        shutil.rmtree(source_folder)
-    except Exception as error:
-      app.logger.exception("Could not remove source folder %s", source_folder)
-      return jsonify({"error": f"Saved {folder_name}.pdf, but source folder cleanup failed: {error}"}), 500
+    final_status = "stopped" if not _worker_should_continue(job_id) else "completed"
+    _update_job(job_id, status=final_status, completed=len(results), total=total, current="")
+  except Exception as error:
+    app.logger.exception("Worker failed for job %s", job_id)
+    _update_job(job_id, status="failed", error=str(error))
+    raise
+  finally:
+    _release_workspace(job["workspace_id"], job_id)
 
-    return jsonify({"filename": output_path.name, "path": str(output_path), "source_removed": True})
+
+def worker_loop() -> None:
+  _require_cloud()
+  sqs = _aws_client("sqs")
+  queue_url = os.environ["AWS_SQS_QUEUE_URL"]
+  app.logger.info("PDF Workshop worker polling SQS queue")
+  while True:
+    response = sqs.receive_message(
+      QueueUrl=queue_url,
+      MaxNumberOfMessages=1,
+      WaitTimeSeconds=20,
+            VisibilityTimeout=int(os.getenv("AWS_SQS_VISIBILITY_TIMEOUT", "43200")),
+    )
+    for message in response.get("Messages", []):
+      try:
+        process_job(json.loads(message["Body"])["job_id"])
+        sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=message["ReceiptHandle"])
+      except Exception:
+        app.logger.exception("Queued job failed and will be retried by SQS")
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="127.0.0.1", port=5000)
+  import sys
+
+  if len(sys.argv) > 1 and sys.argv[1] == "worker":
+    worker_loop()
+  else:
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
