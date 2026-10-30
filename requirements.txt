@@ -1,0 +1,4 @@
+Flask==3.0.3
+pypdf==6.19.0
+PyMuPDF==1.26.7
+rapidocr-onnxruntime==1.4.4
